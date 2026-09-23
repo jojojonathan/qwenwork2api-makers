@@ -125,7 +125,7 @@ for i in $(seq 1 20); do
   if curl -sf -o /dev/null "http://127.0.0.1:${PORT}/v1/models" -H "Authorization: Bearer ${API_KEY}"; then
     echo
     msg "就绪: http://127.0.0.1:${PORT}/v1  (key=${API_KEY})"
-    msg "账号数据实时跟随 Windows 客户端：token 刷新/切号 1s 内生效，客户端升级自动换用新版 WASM"
+    msg "账号数据实时跟随 Windows 客户端：token 刷新/切号下一请求即生效（后台每 10s 预热），客户端升级自动换用新版 WASM"
     msg "测试: curl http://127.0.0.1:${PORT}/v1/chat/completions -H 'Authorization: Bearer ${API_KEY}' -H 'Content-Type: application/json' -d '{\"model\":\"flash\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":32}'"
     exit 0
   fi

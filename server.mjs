@@ -227,7 +227,7 @@ function readRequestResult(rp) {
 
 // ---------- token / 上下文管理 ----------
 // 唯一来源：挂载的 Windows 客户端 auth-v2.dat（AES-GCM 密文）。
-// 双通道热更新：每个请求 stat 检查 mtime + 后台 1s 轮询（watchAuthDat），客户端刷新/切号自动跟进。
+// 双通道热更新：每个请求 stat 检查 mtime（正确性保证）+ 后台 10s 轮询（watchAuthDat，提前刷新减首次请求延迟）。
 let curToken = null, curCtx = 0, tokenMtime = 0, ctxToken = null;
 
 function decryptAuthDat(datPath, keyHex) {
@@ -270,7 +270,7 @@ function readMachineId() {
   return crypto.randomUUID();
 }
 
-// 后台实时监听挂载的 auth-v2.dat：1s stat 轮询，mtime 变化即在容器内重新解密。
+// 后台监听挂载的 auth-v2.dat：10s stat 轮询（每次一个 stat 系统调用，开销可忽略），mtime 变化即重新解密。
 // 用 stat 轮询而非 inotify：bind mount（WSL2 /mnt/c 下为 9p）上 inotify 事件不可靠，GLM_proxy 同款方案。
 function watchAuthDat() {
   if (!AUTH_DAT) return;
@@ -278,7 +278,7 @@ function watchAuthDat() {
     console.error(`[qwenwork2api] 未找到 ${AUTH_DAT}，实时监听未启用`);
     return;
   }
-  fs.watchFile(AUTH_DAT, { interval: 1000 }, (curr, prev) => {
+  fs.watchFile(AUTH_DAT, { interval: 10000 }, (curr, prev) => {
     if (curr.mtimeMs === prev.mtimeMs) return;
     try { readToken(); } catch (e) {
       console.error(`[qwenwork2api] auth-v2.dat 变更后重读失败（${e.message}）`);

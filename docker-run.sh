@@ -1,22 +1,19 @@
 #!/usr/bin/env bash
-# qwenwork2api v2 一键启动：解密 token → 同步 WASM → 构建镜像 → 启动容器
+# qwenwork2api v2 一键启动：提取密钥 → 健康校验 → 构建镜像 → 启动容器
 #
 # 用法:
-#   ./docker-run.sh          构建 + 启动（会自动从 Windows 客户端解密最新 token）
+#   ./docker-run.sh          构建 + 启动（token/WASM 运行时从挂载的 Windows 客户端实时读取）
 #   ./docker-run.sh stop     停止并移除容器
 #   ./docker-run.sh logs     跟踪日志
 #
-# 数据流:
-#   Windows 客户端 auth-v2.dat --(DPAPI+AES-GCM 解密)--> state/token.json
-#   Windows 客户端 qoder-auth-wasm 目录 --(复制)--> vendor/*.wasm
-#   容器挂载 state/ → /data，server.mjs 用 token + WASM 签名直连 gateway.qwenwork.cn
-#
-# token 有效期约 7 天，过期后重新运行本脚本即可（自动取客户端最新 token）。
+# 数据流（容器零 WSL 文件挂载，账号数据全部来自只读挂载的 Windows 客户端目录）:
+#   客户端数据目录 QwenWorkCN → /client：auth-v2.dat 实时监听，客户端刷新 token / 切号自动解密跟进
+#   客户端程序目录 Programs/QwenWorkCN → /client-app：动态发现最新版 WASM 与 cosy 版本号，客户端升级自动跟随
+#   state/（aeskey.txt、machine-id）仅是宿主机侧缓存，内容经环境变量注入容器，不挂载
 set -euo pipefail
 
 BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 STATE_DIR="$BASE_DIR/state"
-VENDOR_DIR="$BASE_DIR/vendor"
 IMAGE_NAME="qwenwork2api"
 CONTAINER_NAME="qwenwork2api"
 PORT="${QW2A_PORT:-8787}"
@@ -25,6 +22,7 @@ API_KEY="${QW2A_API_KEY:-sk-qwenwork-20857f643cf5e71d2b2ed8447b01c0f0}"
 # Windows 客户端路径（可环境变量覆盖）
 WIN_USER_DIR="${WIN_USER_DIR:-/mnt/c/Users/64264}"
 AUTH_DAT="$WIN_USER_DIR/AppData/Roaming/QwenWorkCN/auth-v2.dat"
+CLIENT_DATA_DIR="$(dirname "$AUTH_DAT")"  # auth-v2.dat 所在目录，整体只读挂载进容器
 LOCAL_STATE="$WIN_USER_DIR/AppData/Roaming/QwenWorkCN/Local State"
 MACHINE_ID_FILE="$WIN_USER_DIR/.qwenworkcn/machine-id"
 CLIENT_ROOT="$WIN_USER_DIR/AppData/Local/Programs/QwenWorkCN"
@@ -47,7 +45,7 @@ esac
 command -v docker >/dev/null 2>&1 || { warn "缺少 docker"; exit 1; }
 docker info >/dev/null 2>&1 || { warn "docker daemon 未运行"; exit 1; }
 
-mkdir -p "$STATE_DIR" "$VENDOR_DIR"
+mkdir -p "$STATE_DIR"
 
 # PowerShell 完整路径（含回退）
 PS_EXE=""
@@ -79,14 +77,23 @@ Add-Type -AssemblyName System.Security
   msg "AES 密钥已保存 → state/aeskey.txt"
 fi
 
-# ---------- 2. 解密最新 token ----------
+# ---------- 2. 校验 auth-v2.dat 可解密（启动前健康检查） ----------
 if [ ! -f "$AUTH_DAT" ]; then
   warn "找不到 $AUTH_DAT"
   warn "请确认 Windows 客户端已安装并登录；或用 WIN_USER_DIR 环境变量指定 Windows 用户目录"
   exit 1
 fi
-msg "解密客户端最新 token..."
-node "$BASE_DIR/decrypt-token.mjs" "$AUTH_DAT" "$(cat "$STATE_DIR/aeskey.txt")" "$STATE_DIR/token.json"
+msg "校验 auth-v2.dat 可解密（容器内实时解密，这里只确认密钥/文件健康）..."
+# 预解密一份 token.json 作兜底；失败多为客户端重装导致密钥变化，自动重提取密钥并重试一次
+if ! node "$BASE_DIR/decrypt-token.mjs" "$AUTH_DAT" "$(cat "$STATE_DIR/aeskey.txt")" -; then
+  if [ "${QW2A_KEY_RETRY:-}" = "1" ]; then
+    warn "重新提取密钥后仍解密失败，请确认 Windows 客户端已登录"
+    exit 1
+  fi
+  warn "解密失败，尝试重新提取 AES 密钥..."
+  rm -f "$STATE_DIR/aeskey.txt"
+  QW2A_KEY_RETRY=1 exec "$0" "$@"
+fi
 
 # ---------- 3. machine-id ----------
 if [ -f "$MACHINE_ID_FILE" ] && [ -s "$MACHINE_ID_FILE" ]; then
@@ -96,30 +103,20 @@ elif [ ! -s "$STATE_DIR/machine-id" ]; then
   msg "未找到客户端 machine-id，已生成随机值"
 fi
 
-# ---------- 4. 同步 WASM（跟随客户端版本） ----------
-WASM_SRC="$(ls -d "$CLIENT_ROOT"/*/resources/qoder-auth-wasm/qoder_auth_wasm_bg.wasm 2>/dev/null | sort -V | tail -1 || true)"
-if [ -n "$WASM_SRC" ] && [ -f "$WASM_SRC" ]; then
-  cp -f "$WASM_SRC" "$VENDOR_DIR/qoder_auth_wasm_bg.wasm"
-  msg "已同步 WASM（客户端版本 $(basename "$(dirname "$(dirname "$WASM_SRC")")")）"
-elif [ ! -f "$VENDOR_DIR/qoder_auth_wasm_bg.wasm" ]; then
-  warn "找不到客户端 WASM（$CLIENT_ROOT/*/resources/qoder-auth-wasm/）"
-  warn "请安装 Windows QwenWorkCN 客户端后再运行"
-  exit 1
-else
-  warn "未找到新客户端 WASM，沿用 vendor/ 中现有版本"
-fi
-
-# ---------- 5. 构建镜像 ----------
+# ---------- 4. 构建镜像 ----------
 msg "构建镜像 $IMAGE_NAME（秒级，零依赖）..."
 docker build -q -t "$IMAGE_NAME" "$BASE_DIR" >/dev/null
 
-# ---------- 6. 启动容器 ----------
+# ---------- 5. 启动容器 ----------
 docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
 docker run -d \
   --name "$CONTAINER_NAME" \
   --restart unless-stopped \
   -p "${PORT}:8787" \
-  -v "${STATE_DIR}:/data:ro" \
+  -v "${CLIENT_DATA_DIR}:/client:ro" \
+  -v "${CLIENT_ROOT}:/client-app:ro" \
+  -e "QW2A_AES_KEY=$(cat "$STATE_DIR/aeskey.txt")" \
+  -e "QW2A_MACHINE_ID=$(cat "$STATE_DIR/machine-id")" \
   -e "QW2A_API_KEY=${API_KEY}" \
   "$IMAGE_NAME" >/dev/null
 
@@ -128,6 +125,7 @@ for i in $(seq 1 20); do
   if curl -sf -o /dev/null "http://127.0.0.1:${PORT}/v1/models" -H "Authorization: Bearer ${API_KEY}"; then
     echo
     msg "就绪: http://127.0.0.1:${PORT}/v1  (key=${API_KEY})"
+    msg "账号数据实时跟随 Windows 客户端：token 刷新/切号 1s 内生效，客户端升级自动换用新版 WASM"
     msg "测试: curl http://127.0.0.1:${PORT}/v1/chat/completions -H 'Authorization: Bearer ${API_KEY}' -H 'Content-Type: application/json' -d '{\"model\":\"flash\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":32}'"
     exit 0
   fi

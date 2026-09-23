@@ -1,14 +1,16 @@
 #!/usr/bin/env bash
-# qwenwork2api v2 一键启动：提取密钥 → 健康校验 → 构建镜像 → 启动容器
+# qwenwork2api v2 一键启动：提取密钥 → 健康校验 → 确认 WASM → 构建镜像 → 启动容器
 #
 # 用法:
-#   ./docker-run.sh          构建 + 启动（token/WASM 运行时从挂载的 Windows 客户端实时读取）
-#   ./docker-run.sh stop     停止并移除容器
-#   ./docker-run.sh logs     跟踪日志
+#   ./docker-run.sh [start] [-d 秒]   构建 + 启动；-d 指定 auth-v2.dat 轮询间隔（秒），默认 30
+#   ./docker-run.sh stop              停止并移除容器
+#   ./docker-run.sh logs              跟踪日志
 #
-# 数据流（容器零 WSL 文件挂载，账号数据全部来自只读挂载的 Windows 客户端目录）:
-#   客户端数据目录 QwenWorkCN → /client：auth-v2.dat 实时监听，客户端刷新 token / 切号自动解密跟进
-#   客户端程序目录 Programs/QwenWorkCN → /client-app：动态发现最新版 WASM 与 cosy 版本号，客户端升级自动跟随
+# 数据流（容器只挂载 Windows 客户端文件，均只读）:
+#   客户端数据目录 QwenWorkCN → /client：auth-v2.dat 启动时解密 + 每 N 秒 stat 轮询跟进，
+#     客户端刷新 token / 切号后最迟 N 秒生效，无需重启
+#   客户端 WASM（本脚本确认最新版本目录后单文件挂载）→ /wasm：容器内静态加载，
+#     客户端升级后重跑本脚本即可
 #   state/（aeskey.txt、machine-id）仅是宿主机侧缓存，内容经环境变量注入容器，不挂载
 set -euo pipefail
 
@@ -32,7 +34,20 @@ export WRANGLER_SEND_METRICS=false
 msg()  { printf '\033[1;32m[qwenwork2api]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[警告]\033[0m %s\n' "$*" >&2; }
 
-case "${1:-start}" in
+# ---------- 参数解析：[-d 秒] [start|stop|logs] ----------
+WATCH_INTERVAL="${QW2A_WATCH_INTERVAL:-30}"
+CMD="start"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -d) WATCH_INTERVAL="${2:?-d 需要参数（秒）}"; shift 2 ;;
+    -d*) WATCH_INTERVAL="${1#-d}"; shift ;;
+    start|stop|logs) CMD="$1"; shift ;;
+    *) echo "未知参数: $1（用法: $0 [start|stop|logs] [-d 轮询秒数]）" >&2; exit 1 ;;
+  esac
+done
+case "$WATCH_INTERVAL" in (*[!0-9]*|'') echo "错误：轮询间隔需为正整数" >&2; exit 1 ;; esac
+
+case "$CMD" in
   stop)
     docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 && msg "容器已停止" || warn "容器未在运行"
     exit 0
@@ -103,20 +118,38 @@ elif [ ! -s "$STATE_DIR/machine-id" ]; then
   msg "未找到客户端 machine-id，已生成随机值"
 fi
 
-# ---------- 4. 构建镜像 ----------
+# ---------- 4. 确认客户端 WASM（最新版本目录）与 cosy 版本 ----------
+WASM_SRC="$(ls "$CLIENT_ROOT"/*/resources/qoder-auth-wasm/qoder_auth_wasm_bg.wasm 2>/dev/null | sort -V | tail -1 || true)"
+if [ -z "$WASM_SRC" ] || [ ! -f "$WASM_SRC" ]; then
+  warn "找不到客户端 WASM（$CLIENT_ROOT/*/resources/qoder-auth-wasm/）"
+  warn "请安装 Windows QwenWorkCN 客户端后再运行"
+  exit 1
+fi
+msg "WASM: $WASM_SRC"
+MANIFEST="$(dirname "$(dirname "$WASM_SRC")")/app.asar.unpacked/node_modules/@qoder-ai/qoder-agent-sdk/dist/runtime-manifest.json"
+COSY_VERSION="$(node -e 'try{console.log(JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).qoderCliVersion||"")}catch{}' "$MANIFEST" 2>/dev/null || true)"
+if [ -n "$COSY_VERSION" ]; then
+  msg "cosy 版本: $COSY_VERSION（来自客户端 runtime-manifest）"
+else
+  COSY_VERSION=""; warn "未能读取 cosy 版本，服务端使用内置默认"
+fi
+
+# ---------- 5. 构建镜像 ----------
 msg "构建镜像 $IMAGE_NAME（秒级，零依赖）..."
 docker build -q -t "$IMAGE_NAME" "$BASE_DIR" >/dev/null
 
-# ---------- 5. 启动容器 ----------
+# ---------- 6. 启动容器 ----------
 docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
 docker run -d \
   --name "$CONTAINER_NAME" \
   --restart unless-stopped \
   -p "${PORT}:8787" \
   -v "${CLIENT_DATA_DIR}:/client:ro" \
-  -v "${CLIENT_ROOT}:/client-app:ro" \
+  -v "${WASM_SRC}:/wasm/qoder_auth_wasm_bg.wasm:ro" \
   -e "QW2A_AES_KEY=$(cat "$STATE_DIR/aeskey.txt")" \
   -e "QW2A_MACHINE_ID=$(cat "$STATE_DIR/machine-id")" \
+  -e "QW2A_WATCH_INTERVAL_SEC=${WATCH_INTERVAL}" \
+  -e "QW2A_COSY_VERSION=${COSY_VERSION}" \
   -e "QW2A_API_KEY=${API_KEY}" \
   "$IMAGE_NAME" >/dev/null
 
@@ -125,7 +158,7 @@ for i in $(seq 1 20); do
   if curl -sf -o /dev/null "http://127.0.0.1:${PORT}/v1/models" -H "Authorization: Bearer ${API_KEY}"; then
     echo
     msg "就绪: http://127.0.0.1:${PORT}/v1  (key=${API_KEY})"
-    msg "账号数据实时跟随 Windows 客户端：token 刷新/切号下一请求即生效（后台每 10s 预热），客户端升级自动换用新版 WASM"
+    msg "token 刷新/切号最迟 ${WATCH_INTERVAL}s 自动跟进；客户端升级后重跑本脚本同步 WASM"
     msg "测试: curl http://127.0.0.1:${PORT}/v1/chat/completions -H 'Authorization: Bearer ${API_KEY}' -H 'Content-Type: application/json' -d '{\"model\":\"flash\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":32}'"
     exit 0
   fi

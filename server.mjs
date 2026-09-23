@@ -1,23 +1,22 @@
 #!/usr/bin/env node
 // qwenwork2api v2 — 直连 gateway.qwenwork.cn 的 OpenAI 兼容服务
-// 架构：Windows 客户端目录只读挂载（auth-v2.dat 实时解密 + WASM 版本热发现）+ business.sub_task 路由
+// 架构：Windows 客户端文件只读挂载（auth-v2.dat 启动解密+定时轮询跟进，WASM 静态加载）+ business.sub_task 路由
 // 参考 PoC：wasm-poc/wbiz.mjs（2026-09-23 实测打通）
 import http from 'node:http';
 import fs from 'node:fs';
-import path from 'node:path';
 import crypto from 'node:crypto';
 
 // ---------- 配置 ----------
 const PORT = parseInt(process.env.QW2A_PORT || '8787', 10);
 const API_KEY = process.env.QW2A_API_KEY || 'sk-qwenwork-20857f643cf5e71d2b2ed8447b01c0f0';
-// Windows 客户端（只读挂载）：数据目录 QwenWorkCN → /client，程序目录 Programs/QwenWorkCN → /client-app
+// Windows 客户端（只读挂载）：数据目录 QwenWorkCN → /client；WASM 由 docker-run.sh 确认最新版后单文件挂载 → /wasm
 const AUTH_DAT = process.env.QW2A_AUTH_DAT || '/client/auth-v2.dat';
 const AES_KEY = (process.env.QW2A_AES_KEY || '').trim();      // DPAPI 提取的 AES-256 密钥（64 位 hex）
 const MACHINE_ID = (process.env.QW2A_MACHINE_ID || '').trim();
-const CLIENT_APP_DIR = process.env.QW2A_CLIENT_APP_DIR || ''; // 挂载的客户端程序目录，动态发现最新版 WASM
-const WASM_FALLBACK = process.env.QW2A_WASM || '';           // 未挂载客户端目录时的回退（不热更新）
+const WASM_PATH = process.env.QW2A_WASM || '/wasm/qoder_auth_wasm_bg.wasm';
+const WATCH_INTERVAL_SEC = Math.max(1, parseInt(process.env.QW2A_WATCH_INTERVAL_SEC || '30', 10));
 const ORIGIN = 'https://gateway.qwenwork.cn';
-const COSY_VERSION_FALLBACK = '1.1.59';                      // 读不到客户端 runtime-manifest 时回退
+const COSY_VERSION = process.env.QW2A_COSY_VERSION || '1.1.59'; // docker-run.sh 从客户端 runtime-manifest 提取注入
 const REQUEST_TIMEOUT = parseInt(process.env.QW2A_TIMEOUT_MS || '180000', 10);
 
 const MODELS = {
@@ -120,48 +119,10 @@ const withWasm = (fn) => { const p = wasmQueue.then(fn); wasmQueue = p.catch(() 
 
 // WASM 热加载：优先从挂载的客户端程序目录动态发现最新版本的 WASM 与 cosy 版本号，
 // 客户端升级（新增版本目录）或 WASM 文件变化时自动重新实例化并作废签名上下文。
-let ex = null, wasmPath = '', wasmMtime = 0, COSY_VER = COSY_VERSION_FALLBACK;
-
-function cmpVerDir(a, b) { // 版本目录名形如 1.2.1-26092107
-  const [va, ba] = a.split('-'), [vb, bb] = b.split('-');
-  const sa = va.split('.').map(Number), sb = vb.split('.').map(Number);
-  for (let i = 0; i < Math.max(sa.length, sb.length); i++) {
-    const d = (sa[i] || 0) - (sb[i] || 0);
-    if (d) return d;
-  }
-  return (parseInt(ba || '0', 10) || 0) - (parseInt(bb || '0', 10) || 0);
-}
-
-function discoverWasm() {
-  let wasm = WASM_FALLBACK, ver = COSY_VERSION_FALLBACK;
-  if (CLIENT_APP_DIR) {
-    const dirs = fs.readdirSync(CLIENT_APP_DIR).filter((d) => /^\d+\.\d+\.\d+-\d+$/.test(d)).sort(cmpVerDir);
-    if (dirs.length) {
-      const latest = dirs[dirs.length - 1];
-      const w = path.join(CLIENT_APP_DIR, latest, 'resources', 'qoder-auth-wasm', 'qoder_auth_wasm_bg.wasm');
-      if (fs.existsSync(w)) wasm = w;
-      const manifest = path.join(CLIENT_APP_DIR, latest, 'resources', 'app.asar.unpacked',
-        'node_modules', '@qoder-ai', 'qoder-agent-sdk', 'dist', 'runtime-manifest.json');
-      try { ver = JSON.parse(fs.readFileSync(manifest, 'utf8')).qoderCliVersion || ver; } catch {}
-    }
-  }
-  return { wasm, ver };
-}
-
-function ensureWasm() {
-  const { wasm, ver } = discoverWasm();
-  if (!wasm) throw new Error('未找到 WASM（客户端程序目录未挂载且未设置 QW2A_WASM）');
-  const st = fs.statSync(wasm);
-  if (ex && wasm === wasmPath && st.mtimeMs === wasmMtime && ver === COSY_VER) return ex;
-  const hot = !!wasmPath;
-  const t0 = Date.now();
-  heap = new Array(1028).fill(undefined); freeHead = 1028; // wasm-bindgen heap 必须随实例重置
-  Pn = new WebAssembly.Instance(new WebAssembly.Module(fs.readFileSync(wasm)), buildImports()).exports;
+let ex = null;
+function loadWasm() {
+  Pn = new WebAssembly.Instance(new WebAssembly.Module(fs.readFileSync(WASM_PATH)), buildImports()).exports;
   ex = Pn;
-  wasmPath = wasm; wasmMtime = st.mtimeMs; COSY_VER = ver;
-  curCtx = 0; ctxToken = null; // 旧 ctx 指向旧实例内存，必须作废重建
-  console.log(`[qwenwork2api] WASM 已${hot ? '热更新' : '加载'}：${wasm}（cosy ${ver}，${Date.now() - t0}ms）`);
-  return ex;
 }
 
 function genAuthFields(userInfoJson) {
@@ -227,8 +188,8 @@ function readRequestResult(rp) {
 
 // ---------- token / 上下文管理 ----------
 // 唯一来源：挂载的 Windows 客户端 auth-v2.dat（AES-GCM 密文）。
-// 双通道热更新：每个请求 stat 检查 mtime（正确性保证）+ 后台 10s 轮询（watchAuthDat，提前刷新减首次请求延迟）。
-let curToken = null, curCtx = 0, tokenMtime = 0, ctxToken = null;
+// 磁盘访问只发生在启动时和后台定时 stat（默认 30s，QW2A_WATCH_INTERVAL_SEC 可调），请求路径纯内存。
+let curToken = null, curCtx = 0, ctxToken = null;
 
 function decryptAuthDat(datPath, keyHex) {
   const key = Buffer.from(keyHex, 'hex');
@@ -242,17 +203,18 @@ function decryptAuthDat(datPath, keyHex) {
   return j;
 }
 
-function readToken() {
-  const st = fs.statSync(AUTH_DAT);
-  if (curToken && st.mtimeMs === tokenMtime) return curToken;
+// 启动时 / 后台轮询 tick 时调用：解密并更新内存 token（磁盘读取仅此与 watchAuthDat 两处）
+function loadTokenFromDisk() {
   if (!/^[0-9a-fA-F]{64}$/.test(AES_KEY)) throw new Error('缺少有效 AES 密钥（QW2A_AES_KEY，64 位 hex）');
-  const t0 = Date.now();
-  const isReload = !!curToken;
   const auth = decryptAuthDat(AUTH_DAT, AES_KEY);
   curToken = auth;
-  tokenMtime = st.mtimeMs;
-  console.log(`[qwenwork2api] token 已从 auth-v2.dat ${isReload ? '刷新' : '加载'}（${Date.now() - t0}ms，用户 ${auth.user.name || auth.user.id}，过期 ${auth.expiresAt || '?'}）`);
   return auth;
+}
+
+// 请求路径调用：纯内存返回，零磁盘交互
+function readToken() {
+  if (!curToken) throw new Error('token 尚未加载（等待客户端 auth-v2.dat 就绪）');
+  return curToken;
 }
 
 function tokenExpiryInfo() {
@@ -270,25 +232,28 @@ function readMachineId() {
   return crypto.randomUUID();
 }
 
-// 后台监听挂载的 auth-v2.dat：10s stat 轮询（每次一个 stat 系统调用，开销可忽略），mtime 变化即重新解密。
-// 用 stat 轮询而非 inotify：bind mount（WSL2 /mnt/c 下为 9p）上 inotify 事件不可靠，GLM_proxy 同款方案。
+// 后台监听挂载的 auth-v2.dat：每 WATCH_INTERVAL_SEC 秒 stat 一次，mtime 变化即重新解密。
+// stat 轮询而非 inotify：bind mount（WSL2 /mnt/c 下为 9p）上事件不可靠，GLM_proxy 同款方案。
 function watchAuthDat() {
-  if (!AUTH_DAT) return;
   try { fs.statSync(AUTH_DAT); } catch {
-    console.error(`[qwenwork2api] 未找到 ${AUTH_DAT}，实时监听未启用`);
+    console.error(`[qwenwork2api] 未找到 ${AUTH_DAT}，后台监听未启用`);
     return;
   }
-  fs.watchFile(AUTH_DAT, { interval: 10000 }, (curr, prev) => {
+  fs.watchFile(AUTH_DAT, { interval: WATCH_INTERVAL_SEC * 1000 }, (curr, prev) => {
     if (curr.mtimeMs === prev.mtimeMs) return;
-    try { readToken(); } catch (e) {
-      console.error(`[qwenwork2api] auth-v2.dat 变更后重读失败（${e.message}）`);
+    try {
+      const auth = decryptAuthDat(AUTH_DAT, AES_KEY);
+      const changed = !curToken || curToken.token !== auth.token;
+      curToken = auth;
+      if (changed) console.log(`[qwenwork2api] token 已刷新（用户 ${auth.user.name || auth.user.id}，过期 ${auth.expiresAt || '?'}），签名上下文下一请求重建`);
+    } catch (e) {
+      console.error(`[qwenwork2api] auth-v2.dat 解密失败（${e.message}，多为客户端写入中），保留当前 token`);
     }
   });
-  console.log(`[qwenwork2api] 已实时监听 ${AUTH_DAT}（客户端刷新/切号后自动解密跟进）`);
+  console.log(`[qwenwork2api] 已监听 ${AUTH_DAT}（每 ${WATCH_INTERVAL_SEC}s 检查一次，客户端刷新/切号自动跟进）`);
 }
 
 function ensureCtx() {
-  ensureWasm(); // WASM/客户端版本变化时热重载并作废 ctx
   const auth = readToken();
   if (curCtx && ctxToken === auth) return curCtx;
   return withWasm(() => {
@@ -297,7 +262,7 @@ function ensureCtx() {
     const uiBase = { uid: auth.user.id, security_oauth_token: auth.token };
     const f = genAuthFields(JSON.stringify(uiBase));
     const userInfo = JSON.stringify({ ...uiBase, ...f });
-    curCtx = newCtx(readMachineId(), COSY_VER, userInfo,
+    curCtx = newCtx(readMachineId(), COSY_VERSION, userInfo,
       JSON.stringify({ client_type: '6', business_product: 'qoder_work', business_type: 'agent', scene: 'qwork' }));
     ctxToken = auth;
     return curCtx;
@@ -385,7 +350,7 @@ function buildUpstreamBody(payload, modelKey, modelInfo) {
       // ★★★ 关键字段：服务端靠 business.sub_task 路由模型目录，缺失即 503 Model catalog unavailable
       business: {
         product: 'qoder_work',
-        version: COSY_VER,
+        version: COSY_VERSION,
         type: 'agent',
         id: bizId,
         name: 'chat',
@@ -463,7 +428,7 @@ const server = http.createServer(async (req, res) => {
   try {
     if (url.pathname === '/' && req.method === 'GET') {
       let tok = null;
-      try { readToken(); tok = { source: 'auth-v2.dat', ...(tokenExpiryInfo() || {}) }; } catch (e) { tok = { error: e.message }; }
+      try { readToken(); tok = { source: 'auth-v2.dat', watch_interval_sec: WATCH_INTERVAL_SEC, ...(tokenExpiryInfo() || {}) }; } catch (e) { tok = { error: e.message }; }
       return sendJson(res, 200, {
         service: 'qwenwork2api', status: 'ok',
         models: Object.keys(MODELS),
@@ -497,16 +462,17 @@ const server = http.createServer(async (req, res) => {
       const modelInfo = MODELS[model] || { key: model, display_name: model };
       const wantStream = payload.stream === true;
 
+      // token 未就绪/已过期统一 503 + server_error：zcode 对 5xx 自动重试（401 认证类不重试），
+      // 客户端刷新 token 后（最迟 WATCH_INTERVAL_SEC 秒跟进）重试即成功
+      const awaitRefresh = (why) => sendJson(res, 503, { error: {
+        message: `${why}，等待客户端刷新 token（容器每 ${WATCH_INTERVAL_SEC}s 自动跟进，请重试）`,
+        type: 'server_error', code: 'token_await_refresh' } });
       let auth;
-      try { auth = readToken(); } catch (e) {
-        return sendJson(res, 503, { error: { message: `token 不可用：${e.message}。请确认 Windows 客户端已登录`, type: 'server_error' } });
-      }
+      try { auth = readToken(); } catch (e) { return awaitRefresh(`token 不可用（${e.message}）`); }
       // JWT 过期预检
       try {
         const jwt = JSON.parse(Buffer.from(auth.token.split('.')[1], 'base64url').toString('utf8'));
-        if (jwt.exp && jwt.exp * 1000 < Date.now()) {
-          return sendJson(res, 401, { error: { message: 'token 已过期，等待客户端刷新 auth-v2.dat 自动跟进；持续过期请在客户端重新登录', type: 'invalid_api_key' } });
-        }
+        if (jwt.exp && jwt.exp * 1000 < Date.now()) return awaitRefresh('token 已过期');
       } catch {}
 
       const ctx = await ensureCtx(); // 先于构造请求体：WASM/cosy 版本热重载后 business.version 才能同步
@@ -520,6 +486,7 @@ const server = http.createServer(async (req, res) => {
 
       if (!upRes.ok) {
         const t = await upRes.text().catch(() => '');
+        if (upRes.status === 401 || upRes.status === 403) return awaitRefresh(`上游 ${upRes.status}（token 已失效）`);
         return sendJson(res, 502, { error: { message: `upstream ${upRes.status}: ${t.slice(0, 300)}`, type: 'upstream_error' } });
       }
 
@@ -624,16 +591,18 @@ const server = http.createServer(async (req, res) => {
 
 // ---------- 启动 ----------
 try {
-  ensureWasm();
+  loadWasm();
 } catch (e) {
-  console.error(`[qwenwork2api] WASM 加载失败: ${e.message}`);
-  console.error('[qwenwork2api] 请确认 docker-run.sh 已挂载客户端程序目录（/client-app）');
+  console.error(`[qwenwork2api] WASM 加载失败（${WASM_PATH}）: ${e.message}`);
+  console.error('[qwenwork2api] 客户端升级后请重跑 docker-run.sh 重新确认 WASM 并重建容器');
   process.exit(1);
 }
-try { readToken(); } catch (e) {
+try {
+  const auth = loadTokenFromDisk();
+  console.log(`[qwenwork2api] token 已加载（用户 ${auth.user.name || auth.user.id}，过期 ${auth.expiresAt || '?'}）`);
+} catch (e) {
   console.error(`[qwenwork2api] token 加载失败（${AUTH_DAT}）: ${e.message}`);
-  console.error('[qwenwork2api] 请确认 Windows 客户端已登录（容器会自动重启重试）');
-  process.exit(1);
+  console.error('[qwenwork2api] 服务不退出，后台监听将在客户端登录后自动加载');
 }
 watchAuthDat();
 server.listen(PORT, '0.0.0.0', () => {

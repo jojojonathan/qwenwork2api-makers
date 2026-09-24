@@ -9,11 +9,12 @@ import crypto from 'node:crypto';
 // ---------- 配置 ----------
 const PORT = parseInt(process.env.QW2A_PORT || '8787', 10);
 const API_KEY = process.env.QW2A_API_KEY || 'sk-qwenwork-20857f643cf5e71d2b2ed8447b01c0f0';
-// Windows 客户端（只读挂载）：数据目录 QwenWorkCN → /client；WASM 由 docker-run.sh 确认最新版后单文件挂载 → /wasm
+// Windows 客户端：数据目录 QwenWorkCN 只读挂载 → /client（token 热跟进）；
+// WASM 由 docker-run.sh 从客户端最新版本目录同步到 vendor/ 后随镜像打包（/app，静态加载）
 const AUTH_DAT = process.env.QW2A_AUTH_DAT || '/client/auth-v2.dat';
 const AES_KEY = (process.env.QW2A_AES_KEY || '').trim();      // DPAPI 提取的 AES-256 密钥（64 位 hex）
 const MACHINE_ID = (process.env.QW2A_MACHINE_ID || '').trim();
-const WASM_PATH = process.env.QW2A_WASM || '/wasm/qoder_auth_wasm_bg.wasm';
+const WASM_PATH = process.env.QW2A_WASM || '/app/qoder_auth_wasm_bg.wasm';
 const WATCH_INTERVAL_SEC = Math.max(1, parseInt(process.env.QW2A_WATCH_INTERVAL_SEC || '30', 10));
 const ORIGIN = 'https://gateway.qwenwork.cn';
 const COSY_VERSION = process.env.QW2A_COSY_VERSION || '1.1.59'; // docker-run.sh 从客户端 runtime-manifest 提取注入

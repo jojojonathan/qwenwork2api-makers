@@ -6,16 +6,17 @@
 #   ./docker-run.sh stop              停止并移除容器
 #   ./docker-run.sh logs              跟踪日志
 #
-# 数据流（容器只挂载 Windows 客户端文件，均只读）:
-#   客户端数据目录 QwenWorkCN → /client：auth-v2.dat 启动时解密 + 每 N 秒 stat 轮询跟进，
+# 数据流（运行时只挂载客户端数据目录；WASM 构建时打包进镜像）:
+#   客户端数据目录 QwenWorkCN → /client（只读）：auth-v2.dat 启动时解密 + 每 N 秒 stat 轮询跟进，
 #     客户端刷新 token / 切号后最迟 N 秒生效，无需重启
-#   客户端 WASM（本脚本确认最新版本目录后单文件挂载）→ /wasm：容器内静态加载，
-#     客户端升级后重跑本脚本即可
+#   客户端 WASM：本脚本确认最新版本目录后拷入 vendor/（gitignored），随镜像构建打包；
+#     客户端升级后重跑本脚本即可（脚本每次都会重建镜像）
 #   state/（aeskey.txt、machine-id）仅是宿主机侧缓存，内容经环境变量注入容器，不挂载
 set -euo pipefail
 
 BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 STATE_DIR="$BASE_DIR/state"
+VENDOR_DIR="$BASE_DIR/vendor"   # WASM 构建暂存（gitignored）
 IMAGE_NAME="qwenwork2api"
 CONTAINER_NAME="qwenwork2api"
 PORT="${QW2A_PORT:-8787}"
@@ -60,7 +61,7 @@ esac
 command -v docker >/dev/null 2>&1 || { warn "缺少 docker"; exit 1; }
 docker info >/dev/null 2>&1 || { warn "docker daemon 未运行"; exit 1; }
 
-mkdir -p "$STATE_DIR"
+mkdir -p "$STATE_DIR" "$VENDOR_DIR"
 
 # PowerShell 完整路径（含回退）
 PS_EXE=""
@@ -126,6 +127,8 @@ if [ -z "$WASM_SRC" ] || [ ! -f "$WASM_SRC" ]; then
   exit 1
 fi
 msg "WASM: $WASM_SRC"
+cp -f "$WASM_SRC" "$VENDOR_DIR/qoder_auth_wasm_bg.wasm"
+msg "已拷入 $VENDOR_DIR/，将随镜像构建打包"
 MANIFEST="$(dirname "$(dirname "$WASM_SRC")")/app.asar.unpacked/node_modules/@qoder-ai/qoder-agent-sdk/dist/runtime-manifest.json"
 COSY_VERSION="$(node -e 'try{console.log(JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).qoderCliVersion||"")}catch{}' "$MANIFEST" 2>/dev/null || true)"
 if [ -n "$COSY_VERSION" ]; then
@@ -145,7 +148,6 @@ docker run -d \
   --restart unless-stopped \
   -p "${PORT}:8787" \
   -v "${CLIENT_DATA_DIR}:/client:ro" \
-  -v "${WASM_SRC}:/wasm/qoder_auth_wasm_bg.wasm:ro" \
   -e "QW2A_AES_KEY=$(cat "$STATE_DIR/aeskey.txt")" \
   -e "QW2A_MACHINE_ID=$(cat "$STATE_DIR/machine-id")" \
   -e "QW2A_WATCH_INTERVAL_SEC=${WATCH_INTERVAL}" \
